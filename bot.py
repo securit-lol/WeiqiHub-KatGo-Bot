@@ -96,7 +96,14 @@ class Engine:
     def genmove(self, color):
         started = time.time()
         reply = self.send(f"genmove {color}")
-        return reply.split(" ")[1], time.time() - started
+        parts = reply.split(" ")
+        if len(parts) > 1:
+            return parts[1], time.time() - started
+        else:
+            print(f"\n[ERROR] KataGo returned an invalid response: '{reply}'")
+            print("The engine either crashed or is not ready. Exiting.")
+            import sys
+            sys.exit(1)
 
     def new_game(self):
         self.send("clear_board")
@@ -131,28 +138,43 @@ def wait_for_opponent(color, board):
     print(f"Waiting for the opponent's move ({color})... Ctrl+C resets the game")
     candidate = None
     matches = 0
+    
+    prev_scan = scan_board()
+    
+    for pos, value in prev_scan.items():
+        if value == color and board[pos] != color:
+            board[pos] = color
 
     while True:
         time.sleep(POLL_INTERVAL)
         scanned = scan_board()
-        added = []
-
+        
         for pos, value in scanned.items():
             if board[pos] != "empty" and value == "empty":
                 board[pos] = "empty"
-            elif value == color and board[pos] != color:
-                added.append(pos)
 
-        if not added:
-            candidate, matches = None, 0
-            continue
+        new_this_tick = [
+            pos for pos, value in scanned.items() 
+            if value == color and board[pos] != color and prev_scan[pos] != color
+        ]
 
-        if added[0] == candidate:
-            matches += 1
-        else:
-            candidate, matches = added[0], 1
+        if len(new_this_tick) == 1:
+            candidate = new_this_tick[0]
+            matches = 1
+        elif candidate:
+            if scanned[candidate] == color:
+                matches += 1
+            else:
+                candidate = None
+                matches = 0
 
-        if matches >= CONFIRMATIONS:
+        prev_scan = scanned
+
+        if candidate and matches >= CONFIRMATIONS:
+            for pos, value in scanned.items():
+                if value != "empty":
+                    board[pos] = value
+                    
             return cell_to_gtp(*candidate), scanned
 
 
@@ -175,7 +197,7 @@ def bot_move(engine, color, board):
         print(f"KataGo thought for {think_time:.1f} s")
 
     print(f"Bot move: {move}")
-    board = scan_board()
+    
     col, row = gtp_to_cell(move)
     board[(col, row)] = color
     pyautogui.click(*to_pixels(col, row))
@@ -205,7 +227,6 @@ def play_game(engine, color):
             print(f"Opponent move: {move}")
             engine.send(f"play {opponent} {move}")
         bot_to_move = not bot_to_move
-
 
 def main():
     if ENABLE_CALIBRATION:
