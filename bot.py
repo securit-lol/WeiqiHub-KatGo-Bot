@@ -2,6 +2,7 @@ import random
 import subprocess
 import sys
 import time
+from itertools import takewhile
 
 import pyautogui
 
@@ -13,10 +14,8 @@ MODEL_PATH = r"C:\Users\koval\Desktop\KataGo\kata1-b28c512nbt-s13255194368-d5935
 ENABLE_CALIBRATION = False
 
 # Pixels for the A19 and T1 intersections
-TOP_LEFT_X = 78
-TOP_LEFT_Y = 109
-BOTTOM_RIGHT_X = 881
-BOTTOM_RIGHT_Y = 912
+TOP_LEFT_X, TOP_LEFT_Y = 78, 109
+BOTTOM_RIGHT_X, BOTTOM_RIGHT_Y = 881, 912
 
 # Delay before a move, in seconds
 MIN_THINK_TIME = 0.5
@@ -26,11 +25,14 @@ BOARD_SIZE = 19
 COLUMNS = "ABCDEFGHJKLMNOPQRST"
 STEP_X = (BOTTOM_RIGHT_X - TOP_LEFT_X) / (BOARD_SIZE - 1)
 STEP_Y = (BOTTOM_RIGHT_Y - TOP_LEFT_Y) / (BOARD_SIZE - 1)
+POINTS = [(c, r) for c in range(BOARD_SIZE) for r in range(BOARD_SIZE)]
 
 BLACK_MAX_BRIGHTNESS = 90
 WHITE_MIN_BRIGHTNESS = 165
 POLL_INTERVAL = 0.2
 CONFIRMATIONS = 2
+
+MAX_RETRIES = 5
 
 LEVELS = {
     "1": ("Very weak, almost random moves", "maxVisits=1,chosenMoveTemperature=1.0"),
@@ -53,15 +55,18 @@ def cell_to_gtp(col, row):
     return f"{COLUMNS[col]}{BOARD_SIZE - row}"
 
 
+def park_mouse():
+    pyautogui.moveTo(0, 0)
+
+
 def calibrate():
     print("\nStar-point calibration")
     time.sleep(3)
     for name in ("D16", "Q16", "Q4", "D4"):
-        x, y = to_pixels(*gtp_to_cell(name))
-        pyautogui.moveTo(x, y, duration=0.5)
+        pyautogui.moveTo(*to_pixels(*gtp_to_cell(name)), duration=0.5)
         if input(f"Is the cursor on point {name}? (y/n): ").strip().lower() != "y":
             sys.exit()
-    pyautogui.moveTo(0, 0)
+    park_mouse()
 
 
 def choose_level():
@@ -74,36 +79,26 @@ def choose_level():
 
 class Engine:
     def __init__(self, overrides):
-        kwargs = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self.process = subprocess.Popen(
             [KATAGO_PATH, "gtp", "-model", MODEL_PATH, "-override-config", overrides],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, **kwargs,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
         self.send("name")
 
     def send(self, command):
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
-        lines = []
-        for line in self.process.stdout:
-            if line == "\n":
-                break
-            lines.append(line)
-        return "".join(lines).strip()
+        return "".join(takewhile(lambda line: line != "\n", self.process.stdout)).strip()
 
     def genmove(self, color):
         started = time.time()
         reply = self.send(f"genmove {color}")
         parts = reply.split(" ")
-        if len(parts) > 1:
-            return parts[1], time.time() - started
-        else:
-            print(f"\n[ERROR] KataGo returned an invalid response: '{reply}'")
-            print("The engine either crashed or is not ready. Exiting.")
-            import sys
-            sys.exit(1)
+        if len(parts) < 2:
+            sys.exit(f"\n[ERROR] KataGo returned an invalid response: '{reply}'\n"
+                     "The engine either crashed or is not ready. Exiting.")
+        return parts[1], time.time() - started
 
     def new_game(self):
         self.send("clear_board")
@@ -112,7 +107,15 @@ class Engine:
 
 
 def empty_board():
-    return {(c, r): "empty" for c in range(BOARD_SIZE) for r in range(BOARD_SIZE)}
+    return {pos: "empty" for pos in POINTS}
+
+
+def classify(brightness):
+    if brightness < BLACK_MAX_BRIGHTNESS:
+        return "b"
+    if brightness > WHITE_MIN_BRIGHTNESS:
+        return "w"
+    return "empty"
 
 
 def scan_board():
@@ -120,89 +123,115 @@ def scan_board():
     img = pyautogui.screenshot()
     offset = int(STEP_X * 0.25)
     state = {}
-    for col in range(BOARD_SIZE):
-        for row in range(BOARD_SIZE):
-            x, y = to_pixels(col, row)
-            corners = [(x + dx, y + dy) for dx in (-offset, offset) for dy in (-offset, offset)]
-            brightness = sum(sum(img.getpixel(p)) / 3 for p in corners) / 4
-            if brightness < BLACK_MAX_BRIGHTNESS:
-                state[(col, row)] = "b"
-            elif brightness > WHITE_MIN_BRIGHTNESS:
-                state[(col, row)] = "w"
-            else:
-                state[(col, row)] = "empty"
+    for pos in POINTS:
+        x, y = to_pixels(*pos)
+        corners = [(x + dx, y + dy) for dx in (-offset, offset) for dy in (-offset, offset)]
+        state[pos] = classify(sum(sum(img.getpixel(p)) for p in corners) / 12)
     return state
+
+
+def update_board_from_scan(board, scanned):
+    missed = {}
+    for pos, value in scanned.items():
+        if board[pos] != "empty" and value == "empty":
+            board[pos] = "empty"
+        elif board[pos] == "empty" and value != "empty":
+            missed[pos] = value
+    return missed
+
+
+def sync_stones(engine, board, stones):
+    for pos, color in stones.items():
+        board[pos] = color
+        engine.send(f"play {color} {cell_to_gtp(*pos)}")
+        print(f"Synced stone: {color} {cell_to_gtp(*pos)}")
+
+
+def sync_existing_stones(engine, board):
+    scanned = scan_board()
+    stones = {pos: v for pos, v in scanned.items() if v != "empty"}
+    sync_stones(engine, board, dict(sorted(stones.items(), key=lambda s: s[1])))
+    values = list(stones.values())
+    return "b" if values.count("b") <= values.count("w") else "w"
 
 
 def wait_for_opponent(color, board):
     print(f"Waiting for the opponent's move ({color})... Ctrl+C resets the game")
-    candidate = None
-    matches = 0
-    
-    prev_scan = scan_board()
-    
-    for pos, value in prev_scan.items():
-        if value == color and board[pos] != color:
-            board[pos] = color
+    candidate, matches = None, 0
+    prev_scan = dict(board)
 
     while True:
         time.sleep(POLL_INTERVAL)
         scanned = scan_board()
-        
-        for pos, value in scanned.items():
-            if board[pos] != "empty" and value == "empty":
-                board[pos] = "empty"
+        update_board_from_scan(board, scanned)
 
         new_this_tick = [
-            pos for pos, value in scanned.items() 
+            pos for pos, value in scanned.items()
             if value == color and board[pos] != color and prev_scan[pos] != color
         ]
-
         if len(new_this_tick) == 1:
-            candidate = new_this_tick[0]
-            matches = 1
+            candidate, matches = new_this_tick[0], 1
+        elif candidate and scanned[candidate] == color:
+            matches += 1
         elif candidate:
-            if scanned[candidate] == color:
-                matches += 1
-            else:
-                candidate = None
-                matches = 0
-
+            candidate, matches = None, 0
         prev_scan = scanned
 
         if candidate and matches >= CONFIRMATIONS:
-            for pos, value in scanned.items():
-                if value != "empty":
-                    board[pos] = value
-                    
-            return cell_to_gtp(*candidate), scanned
+            board.update({pos: value for pos, value in scanned.items() if value != "empty"})
+            return cell_to_gtp(*candidate)
+
+
+def request_free_move(engine, color, board):
+    total_think = 0.0
+    for _ in range(MAX_RETRIES):
+        move, think_time = engine.genmove(color)
+        total_think += think_time
+        if move.lower() in ("resign", "pass"):
+            return move, total_think
+
+        cell = gtp_to_cell(move)
+        scanned = scan_board()
+        missed = update_board_from_scan(board, scanned)
+        if scanned[cell] == "empty":
+            return move, total_think
+
+        print(f"Bot wanted {move}, but that point is occupied. Syncing the missed stone(s) and asking for another move")
+        reply = engine.send("undo")
+        if not reply.startswith("="):
+            print(f"[WARNING] undo failed: '{reply}'")
+        missed.setdefault(cell, scanned[cell])
+        sync_stones(engine, board, missed)
+    return None, total_think
 
 
 def bot_move(engine, color, board):
-    move, think_time = engine.genmove(color)
+    move, think_time = request_free_move(engine, color, board)
 
+    if move is None:
+        print("[ERROR] The bot could not find a free point to play. Stopping this game")
+        return False
     if move.lower() == "resign":
         print("The bot resigned")
-        return False, board
-
+        return False
     if move.lower() == "pass":
         print("The bot passes, click pass in the client yourself")
-        return True, board
+        return True
 
+    message = f"KataGo thought for {think_time:.1f} s"
     pause = random.uniform(MIN_THINK_TIME, MAX_THINK_TIME) - think_time
     if pause > 0:
-        print(f"KataGo thought for {think_time:.1f} s, waiting another {pause:.1f} s")
+        print(f"{message}, waiting another {pause:.1f} s")
         time.sleep(pause)
     else:
-        print(f"KataGo thought for {think_time:.1f} s")
+        print(message)
 
     print(f"Bot move: {move}")
-    
-    col, row = gtp_to_cell(move)
-    board[(col, row)] = color
-    pyautogui.click(*to_pixels(col, row))
-    pyautogui.moveTo(0, 0)
-    return True, board
+    cell = gtp_to_cell(move)
+    board[cell] = color
+    pyautogui.click(*to_pixels(*cell))
+    park_mouse()
+    return True
 
 
 def play_game(engine, color):
@@ -211,22 +240,22 @@ def play_game(engine, color):
 
     print("\nGame started, switch to the WeiqiHub window. Ctrl+C resets the game")
     time.sleep(2)
-    pyautogui.moveTo(0, 0)
+    park_mouse()
     time.sleep(1)
 
     board = empty_board()
-    bot_to_move = color == "b"
+    bot_to_move = sync_existing_stones(engine, board) == color
 
     while True:
         if bot_to_move:
-            playing, board = bot_move(engine, color, board)
-            if not playing:
+            if not bot_move(engine, color, board):
                 return
         else:
-            move, board = wait_for_opponent(opponent, board)
+            move = wait_for_opponent(opponent, board)
             print(f"Opponent move: {move}")
             engine.send(f"play {opponent} {move}")
         bot_to_move = not bot_to_move
+
 
 def main():
     if ENABLE_CALIBRATION:
@@ -249,7 +278,7 @@ def main():
             play_game(engine, color)
         except KeyboardInterrupt:
             print("\nGame interrupted, board reset")
-            pyautogui.moveTo(0, 0)
+            park_mouse()
             time.sleep(1)
 
 
